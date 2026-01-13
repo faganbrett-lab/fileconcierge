@@ -31,14 +31,23 @@ def scan_directory(root: Path):
     Walk the directory and collect:
     - all files
     - total size
-    - extension stats
+    - extension stats (global)
     - size index for duplicate detection
-    - per-directory stats (file count + size)
+    - per-directory stats (file count + size + per-extension breakdown)
+
+    Directory stats are aggregated up the tree so each directory's totals
+    include files in nested subfolders.
     """
     all_files = []
     ext_stats = defaultdict(lambda: {"count": 0, "size": 0})
     size_index = defaultdict(list)
-    dir_stats = defaultdict(lambda: {"count": 0, "size": 0})
+
+    # Each dir entry contains: count, size, ext (defaultdict of ext -> {count,size})
+    dir_stats = defaultdict(lambda: {
+        "count": 0,
+        "size": 0,
+        "ext": defaultdict(lambda: {"count": 0, "size": 0})
+    })
 
     total_size = 0
     total_files = 0
@@ -57,7 +66,7 @@ def scan_directory(root: Path):
             total_size += size
             all_files.append((path, size))
 
-            # --- per-extension stats ---
+            # --- per-extension stats (global) ---
             ext = path.suffix.lower() or "<no_ext>"
             ext_stats[ext]["count"] += 1
             ext_stats[ext]["size"] += size
@@ -65,13 +74,21 @@ def scan_directory(root: Path):
             # --- per-size index (for duplicates) ---
             size_index[size].append(path)
 
-            # --- per-directory stats ---
+            # --- per-directory stats (aggregate up the tree) ---
             # Use a path relative to root so output is shorter.
             rel_dir = dirpath.relative_to(root)
-            # Represent the root directory itself as "."
-            dir_key = Path(".") if str(rel_dir) == "." else rel_dir
-            dir_stats[dir_key]["count"] += 1
-            dir_stats[dir_key]["size"] += size
+            # Build list of this directory and all its ancestors (including root '.')
+            if str(rel_dir) == ".":
+                ancestors = [Path(".")]
+            else:
+                # rel_dir.parents yields parent, grandparent, ..., '.'
+                ancestors = [rel_dir] + list(rel_dir.parents)
+
+            for anc in ancestors:
+                dir_stats[anc]["count"] += 1
+                dir_stats[anc]["size"] += size
+                dir_stats[anc]["ext"][ext]["count"] += 1
+                dir_stats[anc]["ext"][ext]["size"] += size
 
     return {
         "all_files": all_files,
@@ -117,6 +134,7 @@ def find_duplicate_candidates(size_index):
 
 # ---------- Presentation ----------
 
+
 def print_extension_summary(ext_stats, total_files, total_size):
     print("\n=== File Types Summary (All Subfolders) ===")
     print(f"Total files: {total_files}")
@@ -131,27 +149,45 @@ def print_extension_summary(ext_stats, total_files, total_size):
         print(f"{ext:<12} {stats['count']:>8} {format_size(stats['size']):>15}")
 
 
-def print_directory_summary(dir_stats, max_dirs: int = 20):
+def print_directory_summary(dir_stats, top_ext: int = 8):
     """
-    Show the heaviest subfolders (by total size of files inside them).
-    dir_stats keys are Paths relative to the root ('.' means the root itself).
+    Show a summary for every subfolder (each directory's total size is
+    the sum of files in that directory and all nested subdirectories).
+    The list is printed in descending order by total size.
+
+    For each directory, show a compact extension breakdown (top N extensions
+    by size for that directory).
     """
-    print("\n=== Directory Summary (Top Space Hogs) ===")
+    print("\n=== Directory Summary (All Subfolders, sorted by total size) ===")
     if not dir_stats:
         print("No files found.")
         return
 
-    header = f"{'Directory':<40} {'Files':>8} {'Total Size':>15}"
+    header = f"{'Directory':<60} {'Files':>10} {'Total Size':>15}"
     print(header)
     print("-" * len(header))
 
-    # Sort directories by size (desc)
+    # Sort directories by size (desc) and show all
     sorted_dirs = sorted(dir_stats.items(), key=lambda kv: kv[1]["size"], reverse=True)
 
-    for dir_path, stats in sorted_dirs[:max_dirs]:
+    for dir_path, stats in sorted_dirs:
         # Show '.' as root, otherwise the relative path
         dir_label = "." if str(dir_path) == "." else str(dir_path)
-        print(f"{dir_label:<40} {stats['count']:>8} {format_size(stats['size']):>15}")
+        print(f"{dir_label:<60} {stats['count']:>10} {format_size(stats['size']):>15}")
+
+        # Extension breakdown (top N by size)
+        ext_map = stats.get("ext", {})
+        if ext_map:
+            sorted_exts = sorted(ext_map.items(), key=lambda kv: kv[1]["size"], reverse=True)
+            # Limit how many extensions to show per directory
+            for ext, est in sorted_exts[:top_ext]:
+                pct = (est["size"] / stats["size"] * 100) if stats["size"] > 0 else 0.0
+                print(f"    {ext:<10} {est['count']:>8} {format_size(est['size']):>12}  {pct:5.1f}%")
+            # If there are more extensions than we showed, indicate there's more
+            if len(sorted_exts) > top_ext:
+                more = len(sorted_exts) - top_ext
+                print(f"    ... and {more} more extension(s)")
+        print()  # blank line between directories
 
 
 def print_largest_files(largest_files):
@@ -206,8 +242,9 @@ def main():
         data["total_size"],
     )
 
-    # New: per-directory view
-    print_directory_summary(data["dir_stats"], max_dirs=20)
+    # Per-directory view: now shows every subfolder (recursive totals), sorted by size
+    # and includes an extension breakdown per folder (top 8 by size)
+    print_directory_summary(data["dir_stats"], top_ext=8)
 
     # Largest files
     largest = find_largest_files(data["all_files"], top_n=10)
